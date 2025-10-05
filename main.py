@@ -623,3 +623,205 @@ def build_team_season_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return base[out_cols].copy()
 
+
+
+def load_stage6_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load and merge Stage 6 input files."""
+    features_path = os.path.join(CLEAN_DIR, "team_season_features.csv")
+    clusters_path = os.path.join(CLEAN_DIR, "team_season_clusters.csv")
+    labels_path = os.path.join(CLEAN_DIR, "cluster_style_labels.csv")
+    
+    if not all(os.path.exists(p) for p in [features_path, clusters_path, labels_path]):
+        raise FileNotFoundError("Missing Stage 6 input files. Run clustering first.")
+    
+    features = pd.read_csv(features_path)
+    clusters = pd.read_csv(clusters_path)
+    labels = pd.read_csv(labels_path)
+    
+    # Merge clusters and labels
+    clusters = clusters.merge(labels, on="cluster", how="left")
+    
+    # Merge with features
+    merged = features.merge(clusters[["season", "team", "cluster", "style_name", "key_traits"]], 
+                           on=["season", "team"], how="left")
+    
+    return merged, features, labels
+
+
+def compute_trends(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute YoY deltas and slopes for key metrics."""
+    # Define key metrics for analysis
+    metrics = ["TS_pct", "eFG_pct", "pace_proxy", "REB_per_game", "OREB_per_game", 
+               "AST_to_TOV", "STL_per_game", "BLK_per_game"]
+    
+    # Filter to available metrics
+    available_metrics = [m for m in metrics if m in df.columns]
+    
+    trends = []
+    for team in df["team"].unique():
+        team_data = df[df["team"] == team].sort_values("season")
+        if len(team_data) < 2:
+            continue
+            
+        for metric in available_metrics:
+            values = team_data[metric].dropna()
+            if len(values) < 2:
+                continue
+                
+            # YoY delta (last vs first)
+            yoy_delta = values.iloc[-1] - values.iloc[0]
+            
+            # Linear slope over last 3-5 seasons
+            recent_values = values.tail(min(5, len(values)))
+            if len(recent_values) >= 2:
+                x = np.arange(len(recent_values))
+                slope = np.polyfit(x, recent_values, 1)[0]
+            else:
+                slope = np.nan
+                
+            trends.append({
+                "team": team,
+                "metric": metric,
+                "yoy_delta": yoy_delta,
+                "slope": slope,
+                "first_value": values.iloc[0],
+                "last_value": values.iloc[-1],
+                "seasons_count": len(values)
+            })
+    
+    return pd.DataFrame(trends)
+
+
+def analyze_clusters(df: pd.DataFrame) -> pd.DataFrame:
+    """Analyze cluster performance and create league table."""
+    # Define metrics for cluster analysis
+    metrics = ["TS_pct", "eFG_pct", "pace_proxy", "REB_per_game", "OREB_per_game", 
+               "AST_to_TOV", "STL_per_game", "BLK_per_game"]
+    available_metrics = [m for m in metrics if m in df.columns]
+    
+    cluster_stats = []
+    for cluster_id in df["cluster"].dropna().unique():
+        cluster_data = df[df["cluster"] == cluster_id]
+        style_name = cluster_data["style_name"].iloc[0] if "style_name" in cluster_data.columns else f"Cluster {cluster_id}"
+        
+        stats = {"cluster": cluster_id, "style_name": style_name, "team_count": len(cluster_data)}
+        
+        for metric in available_metrics:
+            values = cluster_data[metric].dropna()
+            if len(values) > 0:
+                stats[f"{metric}_mean"] = values.mean()
+                stats[f"{metric}_median"] = values.median()
+                stats[f"{metric}_std"] = values.std()
+        
+        cluster_stats.append(stats)
+    
+    return pd.DataFrame(cluster_stats)
+
+
+def find_outliers(df: pd.DataFrame, z_threshold: float = 2.5) -> pd.DataFrame:
+    """Find statistical outliers in key metrics."""
+    metrics = ["TS_pct", "eFG_pct", "pace_proxy", "REB_per_game", "OREB_per_game", 
+               "AST_to_TOV", "STL_per_game", "BLK_per_game"]
+    available_metrics = [m for m in metrics if m in df.columns]
+    
+    outliers = []
+    for metric in available_metrics:
+        values = df[metric].dropna()
+        if len(values) < 3:
+            continue
+            
+        z_scores = np.abs((values - values.mean()) / values.std())
+        outlier_mask = z_scores > z_threshold
+        
+        if outlier_mask.any():
+            outlier_data = df.loc[outlier_mask, ["season", "team", metric, "cluster", "style_name"]].copy()
+            outlier_data["z_score"] = z_scores[outlier_mask]
+            outlier_data["metric"] = metric
+            outliers.append(outlier_data)
+    
+    if outliers:
+        return pd.concat(outliers, ignore_index=True)
+    else:
+        return pd.DataFrame()
+
+
+def create_leaders_table(trends_df: pd.DataFrame) -> pd.DataFrame:
+    """Create top 10 leaders for each metric."""
+    leaders = []
+    for metric in trends_df["metric"].unique():
+        metric_data = trends_df[trends_df["metric"] == metric].dropna(subset=["yoy_delta"])
+        
+        # Top improvers
+        top_improvers = metric_data.nlargest(5, "yoy_delta")
+        top_improvers["category"] = "Top Improvers"
+        
+        # Top decliners
+        top_decliners = metric_data.nsmallest(5, "yoy_delta")
+        top_decliners["category"] = "Top Decliners"
+        
+        leaders.append(pd.concat([top_improvers, top_decliners], ignore_index=True))
+    
+    if leaders:
+        return pd.concat(leaders, ignore_index=True)
+    else:
+        return pd.DataFrame()
+
+
+def export_stage6_insights(merged_df: pd.DataFrame, trends_df: pd.DataFrame, 
+                          clusters_df: pd.DataFrame, outliers_df: pd.DataFrame, 
+                          leaders_df: pd.DataFrame) -> None:
+    """Export all Stage 6 insights to CSV files."""
+    os.makedirs(CLEAN_DIR, exist_ok=True)
+    
+    # Export trends
+    trends_path = os.path.join(CLEAN_DIR, "insights_trends.csv")
+    trends_df.to_csv(trends_path, index=False)
+    
+    # Export cluster analysis
+    clusters_path = os.path.join(CLEAN_DIR, "insights_clusters.csv")
+    clusters_df.to_csv(clusters_path, index=False)
+    
+    # Export outliers
+    outliers_path = os.path.join(CLEAN_DIR, "insights_outliers.csv")
+    outliers_df.to_csv(outliers_path, index=False)
+    
+    # Export leaders
+    leaders_path = os.path.join(CLEAN_DIR, "insights_leaders.csv")
+    leaders_df.to_csv(leaders_path, index=False)
+    
+    print("Stage 6 insights exported:")
+    print(f"  {trends_path}")
+    print(f"  {clusters_path}")
+    print(f"  {outliers_path}")
+    print(f"  {leaders_path}")
+
+
+def run_stage6_analysis() -> None:
+    """Main Stage 6 analysis pipeline."""
+    print("=== Stage 6: Team Season Insights & Visualization ===")
+    
+    # Load and merge data
+    merged_df, features_df, labels_df = load_stage6_data()
+    print(f"Loaded {len(merged_df)} team-season records")
+    
+    # Compute trends
+    trends_df = compute_trends(merged_df)
+    print(f"Computed trends for {len(trends_df)} team-metric combinations")
+    
+    # Analyze clusters
+    clusters_df = analyze_clusters(merged_df)
+    print(f"Analyzed {len(clusters_df)} clusters")
+    
+    # Find outliers
+    outliers_df = find_outliers(merged_df)
+    print(f"Found {len(outliers_df)} outliers")
+    
+    # Create leaders table
+    leaders_df = create_leaders_table(trends_df)
+    print(f"Created leaders table with {len(leaders_df)} entries")
+    
+    # Export insights
+    export_stage6_insights(merged_df, trends_df, clusters_df, outliers_df, leaders_df)
+    
+    print("Stage 6 analysis completed!")
+
