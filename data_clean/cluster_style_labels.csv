@@ -1,0 +1,4 @@
+cluster,style_name,key_traits
+0,Balanced,"pace_proxy: low, pct_3PA: low, TS_pct: high"
+1,Balanced,"eFG_pct: high, pace_proxy: low, pct_3PA: low"
+2,Balanced,"cluster: high, pace_proxy: high, pct_3PA: high"

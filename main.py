@@ -12,7 +12,7 @@ warnings.filterwarnings("ignore", category=DtypeWarning)
 pd.options.mode.chained_assignment = None
 
 # ====== Paths ======
-RAW_CSV_PATH = "NBA Team Statistics.xlsx"  # Update according to your system
+RAW_CSV_PATH = os.path.join("data", "raw", "NBA Team Statistics.xlsx")  # New default location
 CLEAN_DIR = "data_clean"
 CLEAN_PARQUET = os.path.join(CLEAN_DIR, "PlayerStatistics_clean.parquet")
 CLEAN_CSV = os.path.join(CLEAN_DIR, "PlayerStatistics_clean.csv")
@@ -484,4 +484,142 @@ def load_and_clean(lite: bool = True, force_rebuild: bool = False, raw_csv_path:
 
     return df_clean
 
+
+# ====== 6 — Team-Season Feature Builder ======
+
+def build_team_season_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate game-level team data into Team-Season features for clustering.
+
+    Expected minimal columns in df:
+      - season, game_id, player_team_abbr
+      - scoring/attempts: team_score, field_goals_made, field_goals_attempted,
+        three_pointers_made, three_pointers_attempted, free_throws_made, free_throws_attempted
+      - box stats: reb, oreb, dreb, ast, tov, stl, blk
+      - optional: plus_minus
+
+    Returns a DataFrame with one row per (season, team_abbr) and the features listed in the spec.
+    """
+    required_keys = ["season", "game_id", "player_team_abbr"]
+    for c in required_keys:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column '{c}' in input DataFrame")
+
+    # Helper to safely get a column or zeros if missing
+    def col(name: str) -> pd.Series:
+        return df[name] if name in df.columns else pd.Series([0] * len(df), index=df.index)
+
+    # Prepare working columns (use zeros if missing)
+    pts = col("team_score")
+    fgm = col("field_goals_made")
+    fga = col("field_goals_attempted")
+    fg3m = col("three_pointers_made")
+    fg3a = col("three_pointers_attempted")
+    ftm = col("free_throws_made")
+    fta = col("free_throws_attempted")
+    reb = col("reb")
+    oreb = col("oreb")
+    dreb = col("dreb")
+    ast = col("ast")
+    tov = col("tov")
+    stl = col("stl")
+    blk = col("blk")
+    plus_minus = df["plus_minus"] if "plus_minus" in df.columns else None
+
+    # Build an aggregation frame first to avoid re-summing multiple times
+    work = pd.DataFrame({
+        "season": df["season"],
+        "team": df["player_team_abbr"],
+        "game_id": df["game_id"],
+        "PTS": pts,
+        "FGM": fgm,
+        "FGA": fga,
+        "FG3M": fg3m,
+        "FG3A": fg3a,
+        "FTM": ftm,
+        "FTA": fta,
+        "REB": reb,
+        "OREB": oreb,
+        "DREB": dreb,
+        "AST": ast,
+        "TOV": tov,
+        "STL": stl,
+        "BLK": blk,
+    })
+    if plus_minus is not None:
+        work["PLUS_MINUS"] = plus_minus
+
+    grp = work.groupby(["season", "team"], as_index=False)
+
+    summed = grp[[
+        "PTS", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
+        "REB", "OREB", "DREB", "AST", "TOV", "STL", "BLK"
+    ]].sum()
+
+    games = grp["game_id"].nunique().rename(columns={"game_id": "Games"})
+
+    if plus_minus is not None:
+        pm = grp["PLUS_MINUS"].mean().rename(columns={"PLUS_MINUS": "+/-_avg"})
+        base = summed.merge(games, on=["season", "team"], how="left").merge(pm, on=["season", "team"], how="left")
+    else:
+        base = summed.merge(games, on=["season", "team"], how="left")
+
+    # Feature calculations
+    eps = 1e-9
+    G = base["Games"].clip(lower=1)
+
+    # 1. Basic
+    base["PTS_per_game"] = base["PTS"] / G
+
+    # 2. Shot profile
+    base["FGA_per_game"] = base["FGA"] / G
+    base["FG3A_per_game"] = base["FG3A"] / G
+    base["pct_3PA"] = base["FG3A"] / (base["FGA"].replace(0, pd.NA))
+    base["FTA_per_game"] = base["FTA"] / G
+    base["pct_FTA"] = base["FTA"] / (base["FGA"].replace(0, pd.NA))
+
+    # 3. Offensive efficiency
+    base["FG_pct"] = base["FGM"] / (base["FGA"].replace(0, pd.NA))
+    base["FG3_pct"] = base["FG3M"] / (base["FG3A"].replace(0, pd.NA))
+    base["FT_pct"] = base["FTM"] / (base["FTA"].replace(0, pd.NA))
+    base["eFG_pct"] = (base["FGM"] + 0.5 * base["FG3M"]) / (base["FGA"].replace(0, pd.NA))
+    base["TS_pct"] = base["PTS"] / (2 * (base["FGA"] + 0.44 * base["FTA"]).replace(0, pd.NA))
+
+    # 4. Rebounds
+    base["REB_per_game"] = base["REB"] / G
+    base["OREB_per_game"] = base["OREB"] / G
+    base["DREB_per_game"] = base["DREB"] / G
+
+    # 5. Assists and turnovers
+    base["AST_per_game"] = base["AST"] / G
+    base["TOV_per_game"] = base["TOV"] / G
+    base["AST_to_TOV"] = base["AST"] / (base["TOV"].replace(0, pd.NA))
+
+    # 6. Defense
+    base["STL_per_game"] = base["STL"] / G
+    base["BLK_per_game"] = base["BLK"] / G
+
+    # 7. Control / Pace proxy
+    base["pace_proxy"] = base["FGA"] / G
+    if plus_minus is not None:
+        base["plus_minus_avg"] = base["+/-_avg"]
+
+    # Clean up infs/nans from zero-denominator divisions
+    base = base.replace([pd.NA, np.inf, -np.inf], 0)
+
+    # Reorder/select columns
+    out_cols = [
+        "season", "team", "Games",
+        "PTS_per_game",
+        "FGA_per_game", "FG3A_per_game", "pct_3PA",
+        "FTA_per_game", "pct_FTA",
+        "FG_pct", "FG3_pct", "FT_pct", "eFG_pct", "TS_pct",
+        "REB_per_game", "OREB_per_game", "DREB_per_game",
+        "AST_per_game", "TOV_per_game", "AST_to_TOV",
+        "STL_per_game", "BLK_per_game",
+        "pace_proxy",
+    ]
+    if plus_minus is not None:
+        out_cols.append("plus_minus_avg")
+
+    return base[out_cols].copy()
 
